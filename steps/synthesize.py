@@ -64,6 +64,9 @@ def build_dubbed_audio(video_path, segments, output_audio_path):
     The track starts as pure silence with exactly the video's duration. Each
     dubbed segment is speed-adjusted to fit its original dialogue window and
     then overlaid at its original start timestamp, so silent gaps stay silent.
+    A clip that still overflows its window (speed clamped at MAX_SPEED_UP) is
+    trimmed to the window so it can never bleed into the surrounding silence
+    or overlap the next segment.
 
     segments: list of dicts with keys start, end, tts_path.
     """
@@ -80,6 +83,7 @@ def build_dubbed_audio(video_path, segments, output_audio_path):
     with tempfile.TemporaryDirectory() as tmpdir:
         for idx, seg in enumerate(segments):
             start_ms = int(round(seg["start"] * 1000))
+            window_ms = max(int(round((seg["end"] - seg["start"]) * 1000)), 200)
             print(
                 f"[INFO] Placing segment {idx + 1}/{len(segments)} at "
                 f"{start_ms}ms ({seg['start']:.2f}s)"
@@ -93,6 +97,13 @@ def build_dubbed_audio(video_path, segments, output_audio_path):
                 .set_channels(1)
                 .set_sample_width(2)
             )
+            if len(clip) > window_ms:
+                print(
+                    f"[INFO] Segment {idx + 1}: clip is {len(clip)}ms but window "
+                    f"is {window_ms}ms; trimming to the window so the gap stays "
+                    f"silent and the next segment starts on time"
+                )
+                clip = clip[:window_ms]
             base = base.overlay(clip, position=start_ms)
 
         # Clamp to the exact video duration so a segment that overflowed its
