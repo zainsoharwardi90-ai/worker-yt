@@ -1,6 +1,10 @@
 import re
 from deep_translator import GoogleTranslator
 
+# Translation operates ONLY on the segment text (strings). It never receives or
+# returns timing metadata, so segment start/end and ordering are preserved by
+# construction. Timeline association happens in main.py, which keeps the
+# original segment dict (start/end/text) and stores translated_text on it.
 MAX_CHUNK_LENGTH = 4500
 
 _translators = {}
