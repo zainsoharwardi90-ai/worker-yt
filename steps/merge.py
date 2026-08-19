@@ -43,26 +43,33 @@ def build_atempo(ratio):
 
 
 def merge(video_path, audio_path, output_path):
+    """Mux the timestamp-aligned dubbed audio track back onto the video.
+
+    The audio track from synthesize.build_dubbed_audio is a silent base
+    exactly as long as the video, with each dubbed segment overlaid at its
+    original start timestamp (see audio_assembler.py in the reference
+    implementation for the same concept). The timeline must therefore NOT be
+    stretched here: a global atempo would shift every segment off its
+    timestamp and destroy both lipsync and the silent gaps between dialogue.
+
+    We only cap the output to the video's own duration so the video timeline
+    always stays the fixed reference; any last-millisecond audio overrun is
+    trimmed and any shortfall leaves trailing silence.
+    """
     video_duration = get_duration(video_path)
     audio_duration = get_duration(audio_path)
 
-    if video_duration <= 0 or audio_duration <= 0:
-        raise RuntimeError("Invalid duration from ffprobe (video or audio)")
+    if video_duration <= 0:
+        raise RuntimeError("Invalid duration from ffprobe (video)")
+    if audio_duration <= 0:
+        raise RuntimeError("Invalid duration from ffprobe (audio)")
 
-    ratio = video_duration / audio_duration
-
-    atempo_filter = None
-    if ratio < 0.95 or ratio > 1.05:
-        atempo_filter = build_atempo(ratio)
+    delta = abs(video_duration - audio_duration)
+    if delta > 1.0:
         print(
-            f"[INFO] Duration mismatch: video={video_duration:.2f}s, "
-            f"tts={audio_duration:.2f}s, ratio={ratio:.3f}. "
-            f"Applying audio filter: {atempo_filter}"
-        )
-    else:
-        print(
-            f"[INFO] Durations close enough: video={video_duration:.2f}s, "
-            f"tts={audio_duration:.2f}s, ratio={ratio:.3f}. No speed adjustment."
+            f"[WARN] Audio track is {delta:.2f}s off the video timeline "
+            f"(video={video_duration:.2f}s, audio={audio_duration:.2f}s). "
+            f"Keeping the video timeline as-is; no re-stretching applied."
         )
 
     cmd = [
@@ -74,10 +81,10 @@ def merge(video_path, audio_path, output_path):
         '-b:a', '192k',
         '-map', '0:v:0',
         '-map', '1:a:0',
+        '-t', f'{video_duration:.6f}',
+        '-movflags', '+faststart',
+        output_path,
     ]
-    if atempo_filter:
-        cmd += ['-filter:a', atempo_filter]
-    cmd += ['-shortest', '-movflags', '+faststart', output_path]
 
     print(f"[INFO] Running merge: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
