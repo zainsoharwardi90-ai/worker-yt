@@ -13,7 +13,9 @@ RETRY_WAIT_SECONDS = 20
 CHUNK_THRESHOLD_SEC = 60
 CHUNK_DURATION_SEC = 50
 REQUEST_TIMEOUT = 300
-MIN_SEGMENT_GAP = 0.5
+# Maximum gap (seconds) between two segments that gets merged into one dialogue
+# window. Preserves pauses larger than this so meaningful silences survive.
+MIN_SEGMENT_GAP = float(os.environ.get("MIN_SEGMENT_GAP", "0.5"))
 RATE_LIMIT_DELAY_SECONDS = float(os.environ.get("RATE_LIMIT_DELAY_SECONDS", "1.0"))
 
 
@@ -71,7 +73,9 @@ def merge_close_segments(segments, max_gap=MIN_SEGMENT_GAP):
 
     This keeps dialogues (and their start/end windows) intact so a single
     TTS utterance maps to one continuous speech window instead of several
-    overlapping micro-clips.
+    overlapping micro-clips. Segments that actually overlap (start before the
+    previous end) are merged as well — this is the deterministic overlap
+    resolution used by finalize_segments.
     """
     if not segments:
         return segments
@@ -86,6 +90,78 @@ def merge_close_segments(segments, max_gap=MIN_SEGMENT_GAP):
             current = dict(seg)
     merged.append(current)
     return merged
+
+
+def finalize_segments(segments, duration):
+    """Sort, merge, clamp and validate raw Whisper segments for the GLOBAL timeline.
+
+    Guarantees for every returned segment:
+      * start >= 0 and end > start
+      * chronological order (sorted by start)
+      * no overlap (overlapping windows are merged deterministically)
+      * no timestamp beyond the media duration
+
+    Fixable issues are clamped and logged so timing problems are diagnosable.
+    """
+    if not segments:
+        return []
+
+    raw = []
+    for s in segments:
+        try:
+            start = float(s.get("start") or 0.0)
+            end = float(s.get("end") or start)
+        except (TypeError, ValueError):
+            print(f"[WARN] Segment with non-numeric timestamp: {s!r}; skipping")
+            continue
+        raw.append({
+            "start": start,
+            "end": end if end > start else start + 0.1,
+            "text": s.get("text") or "",
+        })
+
+    neg_clamped = sum(1 for s in raw if s["start"] < 0)
+    for s in raw:
+        if s["start"] < 0:
+            s["start"] = 0.0
+            s["end"] = max(s["end"], 0.0)
+
+    raw.sort(key=lambda s: s["start"])
+    merged = merge_close_segments(raw)
+
+    fixed = []
+    clamped_end = 0
+    dropped = 0
+    for s in merged:
+        start = s["start"]
+        end = min(s["end"], duration)
+        if end <= start:
+            print(f"[WARN] Dropping degenerate segment [{start:.3f}, {end:.3f}]: {s['text'][:60]!r}")
+            dropped += 1
+            continue
+        if s["end"] > duration:
+            clamped_end += 1
+        fixed.append({
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text": s["text"],
+        })
+
+    # Final overlap safety net (merge_close_segments already handles overlaps).
+    for prev, cur in zip(fixed, fixed[1:]):
+        if cur["start"] < prev["end"]:
+            print(
+                f"[WARN] Overlap resolved: segment ending at {prev['end']:.3f}s "
+                f"capped to next segment start {cur['start']:.3f}s"
+            )
+            prev["end"] = cur["start"]
+
+    print(
+        f"[TRANSCRIBE] {len(fixed)} segments "
+        f"(merged from {len(raw)} raw, {neg_clamped} negative-start clamped, "
+        f"{clamped_end} end-over-duration clamped, {dropped} dropped)"
+    )
+    return fixed
 
 
 def _request_url(with_timestamps):
@@ -199,10 +275,21 @@ def transcribe(audio_path, source_lang=None):
             for i, chunk_path in enumerate(chunks):
                 with open(chunk_path, "rb") as f:
                     audio_bytes = f.read()
-                print(f"[INFO] Transcribing chunk {i + 1}/{len(chunks)}: {chunk_path}")
+                # GLOBAL timeline offset: chunk i covers [i*CHUNK_DURATION_SEC, ...).
+                # chunk-local Whisper timestamps are shifted by this offset so every
+                # segment lands on the original audio/video timeline.
+                chunk_offset = i * CHUNK_DURATION_SEC
+                remaining = max(duration - chunk_offset, 0.0)
+                chunk_len = min(CHUNK_DURATION_SEC, remaining)
+                print(
+                    f"[INFO] Transcribing chunk {i + 1}/{len(chunks)} "
+                    f"({chunk_offset:.1f}s-{chunk_offset + chunk_len:.1f}s): {chunk_path}"
+                )
                 all_segments.extend(
                     _transcribe_request(
-                        audio_bytes, token, chunk_offset=i * CHUNK_DURATION_SEC
+                        audio_bytes, token,
+                        chunk_offset=chunk_offset,
+                        fallback_duration=max(chunk_len, 0.1),
                     )
                 )
                 if i < len(chunks) - 1:
@@ -227,7 +314,4 @@ def transcribe(audio_path, source_lang=None):
             audio_bytes, token, chunk_offset=0.0, fallback_duration=duration
         )
 
-    all_segments.sort(key=lambda s: s["start"])
-    merged = merge_close_segments(all_segments)
-    print(f"[TRANSCRIBE] {len(merged)} dialogue segments")
-    return merged
+    return finalize_segments(all_segments, duration)
