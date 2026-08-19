@@ -11,7 +11,7 @@ from steps.transcribe import transcribe
 from steps.translate import translate
 from steps.text_to_speech import generate_speech
 from steps.synthesize import build_dubbed_audio
-from steps.merge import merge
+from steps.merge import merge, get_duration
 
 NEON_DATABASE_URL = os.environ.get("NEON_DATABASE_URL", "")
 
@@ -97,36 +97,88 @@ def process_job(job_data):
             if not valid:
                 raise RuntimeError(f"Downloaded video is invalid: {reason}")
 
+            video_duration = get_duration(video_path)
+            if video_duration <= 0:
+                raise RuntimeError(f"Invalid video duration: {video_duration}")
+            print(f"[INFO] Video duration for job {job_id}: {video_duration:.2f}s")
+
             print(f"[INFO] Extracting audio for job {job_id}")
             extract_audio(video_path, audio_path)
 
             print(f"[INFO] Transcribing for job {job_id}")
             segments = transcribe(audio_path, source_lang)
 
+            total = len(segments)
+            kept = 0
             for idx, seg in enumerate(segments):
+                seg_start = seg["start"]
+                seg_end = seg["end"]
+                window = max(seg_end - seg_start, 0.2)
                 print(
-                    f"[INFO] Translating segment {idx + 1}/{len(segments)} "
-                    f"({seg['start']:.2f}s-{seg['end']:.2f}s)"
+                    f"[INFO] Translating segment {idx + 1}/{total} "
+                    f"({seg_start:.2f}s-{seg_end:.2f}s, window {window:.2f}s)"
                 )
-                translated_text = translate(seg["text"], target_lang)
-                if not (translated_text or "").strip():
+                try:
+                    translated_text = translate(seg["text"], target_lang)
+                except Exception as e:
                     print(
-                        f"[WARN] Segment {idx + 1} produced empty translation; "
-                        f"skipping it"
+                        f"[WARN] Segment {idx + 1}: translation failed ({e}); "
+                        f"leaving silence"
                     )
                     seg["tts_path"] = None
                     continue
-                tts_path = os.path.join(tmpdir, f"speech_{idx}.mp3")
-                print(
-                    f"[INFO] Generating speech for segment {idx + 1}/{len(segments)}"
-                )
-                generate_speech(translated_text, tts_path, target_lang)
-                seg["tts_path"] = tts_path
+                if not (translated_text or "").strip():
+                    print(
+                        f"[WARN] Segment {idx + 1}: empty translation; leaving silence"
+                    )
+                    seg["tts_path"] = None
+                    continue
+                seg["translated_text"] = translated_text
 
+                tts_path = os.path.join(tmpdir, f"speech_{idx}.mp3")
+                print(f"[INFO] Generating speech for segment {idx + 1}/{total}")
+                try:
+                    generate_speech(translated_text, tts_path, target_lang)
+                except Exception as e:
+                    print(
+                        f"[WARN] Segment {idx + 1}: TTS generation failed ({e}); "
+                        f"leaving silence"
+                    )
+                    seg["tts_path"] = None
+                    continue
+                if not os.path.isfile(tts_path) or os.path.getsize(tts_path) == 0:
+                    print(
+                        f"[WARN] Segment {idx + 1}: TTS produced no audio; "
+                        f"leaving silence"
+                    )
+                    seg["tts_path"] = None
+                    continue
+
+                tts_duration = get_duration(tts_path)
+                seg["tts_duration"] = tts_duration
+                print(
+                    f"[INFO] Segment {idx + 1}: original {seg_start:.2f}s->{seg_end:.2f}s "
+                    f"(window {window:.2f}s), TTS {tts_duration:.2f}s, "
+                    f"required tempo {tts_duration / window:.2f}x"
+                )
+                seg["tts_path"] = tts_path
+                kept += 1
+
+            skipped = [s for s in segments if not s.get("tts_path")]
             segments = [s for s in segments if s.get("tts_path")]
+            print(
+                f"[INFO] {kept}/{total} segments have TTS "
+                f"({len(skipped)} left silent; positions preserved by timestamps)"
+            )
 
             print(f"[INFO] Building combined dubbed audio track for job {job_id}")
             build_dubbed_audio(video_path, segments, dubbed_audio_path)
+
+            dubbed_duration = get_duration(dubbed_audio_path)
+            print(
+                f"[INFO] Dubbed audio duration {dubbed_duration:.2f}s vs "
+                f"video {video_duration:.2f}s"
+            )
 
             print(f"[INFO] Muxing audio with original video for job {job_id}")
             merge(video_path, dubbed_audio_path, output_video_path)
