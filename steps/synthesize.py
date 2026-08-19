@@ -7,9 +7,13 @@ from steps.merge import get_duration, build_atempo
 TARGET_SAMPLE_RATE = 44100
 
 # --- Configurable synchronization constants (overridable via env vars) ---
-# Maximum speed-up factor applied to a TTS clip while preserving pitch
-# (atempo). Above this the clip is NOT stretched further; a fallback applies.
-MAX_SPEED_UP = float(os.environ.get("TTS_MAX_SPEED_UP", "1.5"))
+# Never slow TTS down below natural speed. A shorter voice keeps its natural
+# pace; the remainder of the window stays silent (Case A).
+MIN_TEMPO = float(os.environ.get("TTS_MIN_TEMPO", "1.0"))
+# Safe maximum speed-up for pitch-preserving atempo (Case B fits inside it;
+# Case C uses it as a cap before a deterministic fallback applies).
+MAX_TEMPO = float(os.environ.get("TTS_MAX_TEMPO", "1.5"))
+MAX_SPEED_UP = MAX_TEMPO  # legacy alias
 # Minimum effective speech window to guard degenerate / fully-overlapped
 # segments so a tiny or zero-length window can never divide-by-zero.
 MIN_WINDOW_SEC = float(os.environ.get("TTS_MIN_WINDOW_SEC", "0.2"))
@@ -55,6 +59,48 @@ def _load_clip(path):
     )
 
 
+def _validate_inputs(video_duration, segments):
+    """Validate the video timeline and segment list before synthesis.
+
+    Clamps fixable issues (negative starts, ends beyond the video, unsorted
+    order) and drops segments whose timings are unusable. Mutates the segment
+    dicts in place, adding "_drop" for unusable ones; returns None.
+    """
+    if not video_duration or video_duration <= 0:
+        raise RuntimeError(f"Invalid video duration from ffprobe: {video_duration}")
+    print(
+        f"[INFO] Validated video duration: {video_duration:.2f}s, "
+        f"{len(segments)} segment(s)"
+    )
+    n_neg = n_over = n_unsorted = 0
+    prev_start = -1.0
+    for i, seg in enumerate(segments):
+        start = float(seg.get("start") or 0.0)
+        end = float(seg.get("end") or start)
+        if start < 0:
+            n_neg += 1
+            seg["start"] = 0.0
+            start = 0.0
+        if end <= start:
+            print(f"[WARN] Segment {i + 1}: end {end:.2f} <= start {start:.2f}; dropping")
+            seg["_drop"] = True
+            continue
+        if end > video_duration:
+            n_over += 1
+            seg["end"] = float(video_duration)
+            end = float(video_duration)
+        if start < prev_start - 0.01:
+            n_unsorted += 1
+        prev_start = start
+    if n_neg:
+        print(f"[WARN] {n_neg} segment(s) with negative start clamped to 0")
+    if n_over:
+        print(f"[WARN] {n_over} segment(s) ending beyond video duration clamped to {video_duration:.2f}s")
+    if n_unsorted:
+        print("[WARN] Segments were out of order; sorting chronologically before placement")
+    segments.sort(key=lambda s: float(s.get("start") or 0.0))
+
+
 def build_dubbed_audio(video_path, segments, output_audio_path):
     """Build a single timeline-based combined audio track for the whole video.
 
@@ -80,6 +126,7 @@ def build_dubbed_audio(video_path, segments, output_audio_path):
     segments: list of dicts with keys start, end, tts_path.
     """
     video_duration = get_duration(video_path)
+    _validate_inputs(video_duration, segments)
     video_duration_ms = int(round(video_duration * 1000))
     print(
         f"[INFO] Creating silent base track of {video_duration_ms}ms "
@@ -89,10 +136,11 @@ def build_dubbed_audio(video_path, segments, output_audio_path):
     base = AudioSegment.silent(duration=video_duration_ms, frame_rate=TARGET_SAMPLE_RATE)
 
     ordered = sorted(
-        [s for s in segments if s.get("tts_path")], key=lambda s: s["start"]
+        [s for s in segments if s.get("tts_path") and not s.get("_drop")],
+        key=lambda s: s["start"],
     )
     if not ordered:
-        print("[WARN] No speech segments found; exporting silent track")
+        print("[WARN] No valid speech segments found; exporting silent track")
         base.export(output_audio_path, format="wav")
         return output_audio_path
 
@@ -130,26 +178,36 @@ def build_dubbed_audio(video_path, segments, output_audio_path):
                 print(f"[WARN] Segment {idx + 1}: could not measure TTS duration; skipping")
                 continue
 
+            overlap = next_start < end
             required_speed = tts_duration / window
+            if overlap:
+                overlap_status = (
+                    f"OVERLAP -> window capped to {window:.2f}s "
+                    f"(next boundary at {next_start:.2f}s)"
+                )
+            else:
+                overlap_status = f"no overlap (next boundary at {next_start:.2f}s)"
             print(f"\nSegment {idx + 1}")
             print(f"Original: {start:.2f}s -> {end:.2f}s")
+            print(f"Original duration: {max(end - start, 0):.2f}s")
             print(f"Available duration: {window:.2f}s")
             print(f"TTS duration: {tts_duration:.2f}s")
-            print(f"Required speed: {required_speed:.2f}x")
+            print(f"Required tempo: {required_speed:.2f}x")
+            print(f"Overlap status: {overlap_status}")
 
-            if required_speed <= 1.0 + FIT_EPSILON:
-                # Case 1: TTS fits at natural speed. No stretching, silence
+            if required_speed <= MIN_TEMPO + FIT_EPSILON:
+                # Case A: TTS fits at natural speed. No stretching, silence
                 # for the remaining part of the window.
                 clip = _load_clip(tts_path)
                 final_duration = len(clip) / 1000.0
                 action = (
-                    f"kept natural speed + silence remainder "
+                    f"natural speed + remaining silence "
                     f"({max(window - final_duration, 0):.2f}s)"
                 )
                 print(f"Final duration: {final_duration:.2f}s")
 
-            elif required_speed <= MAX_SPEED_UP:
-                # Case 2: slightly longer — stretch the complete sentence so it
+            elif required_speed <= MAX_TEMPO:
+                # Case B: slightly longer — stretch the complete sentence so it
                 # lands exactly at the end of the window.
                 fit_path = os.path.join(tmpdir, f"fitted_tts_{idx}.wav")
                 _time_stretch(tts_path, required_speed, fit_path, idx + 1)
@@ -159,24 +217,27 @@ def build_dubbed_audio(video_path, segments, output_audio_path):
                 print(f"Final duration: {final_duration:.2f}s")
 
             else:
-                # Case 3: significantly longer. First apply max-speed stretch so
+                # Case C: significantly longer. First apply max-speed stretch so
                 # the whole sentence survives, then decide if more room is needed.
-                print(f"[WARN] Required speed {required_speed:.2f}x exceeds max {MAX_SPEED_UP:.2f}x")
+                print(
+                    f"[WARN] Required tempo {required_speed:.2f}x exceeds "
+                    f"max {MAX_TEMPO:.2f}x"
+                )
                 fit_path = os.path.join(tmpdir, f"fitted_tts_{idx}.wav")
-                _time_stretch(tts_path, MAX_SPEED_UP, fit_path, idx + 1)
+                _time_stretch(tts_path, MAX_TEMPO, fit_path, idx + 1)
                 clip = _load_clip(fit_path)
                 final_duration = get_duration(fit_path)
 
                 if start + final_duration <= hard_end + FIT_EPSILON:
                     action = (
-                        f"fallback: max speed stretch, ends at "
+                        f"fallback: max tempo stretch, ends at "
                         f"{start + final_duration:.2f}s (extends "
                         f"{start + final_duration - end:.2f}s past segment end, "
                         f"before next segment)"
                     )
                     print(f"Final duration: {final_duration:.2f}s")
                 else:
-                    action = "fallback: max speed + safety trim at hard boundary"
+                    action = "fallback: max tempo + safety trim at hard boundary"
                     print(
                         f"Final duration (before safety trim): {final_duration:.2f}s, "
                         f"will be capped at {max(hard_end - start, 0):.2f}s"
@@ -185,6 +246,7 @@ def build_dubbed_audio(video_path, segments, output_audio_path):
                         f"WARNING: TTS significantly exceeds available speech window"
                     )
 
+            print(f"Placement: {start:.2f}s")
             print(f"Action: {action}")
             placed_actions.append(action)
 
@@ -215,4 +277,17 @@ def build_dubbed_audio(video_path, segments, output_audio_path):
         print(f"  - {act}")
     print(f"[INFO] Exporting combined audio track: {output_audio_path}")
     base.export(output_audio_path, format="wav")
+
+    # Post-synthesis validation: the timeline must match the video.
+    final_duration = get_duration(output_audio_path)
+    if abs(final_duration - video_duration) > 0.2:
+        print(
+            f"[WARN] Post-synthesis check: final audio {final_duration:.2f}s differs "
+            f"from video {video_duration:.2f}s (delta {abs(final_duration - video_duration):.2f}s)"
+        )
+    else:
+        print(
+            f"[INFO] Post-synthesis check: final audio {final_duration:.2f}s "
+            f"matches video timeline {video_duration:.2f}s"
+        )
     return output_audio_path
