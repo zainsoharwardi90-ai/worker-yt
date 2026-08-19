@@ -23,12 +23,14 @@ def get_duration(path):
 
 
 def build_atempo(ratio):
-    """Build a chained atempo filter to match audio duration to the video.
+    """Build a chained atempo filter for per-segment duration fitting in
+    synthesize.py (NOT for global video-length matching).
 
-    ratio = video_duration / tts_audio_duration. To make the TTS audio last
-    as long as the video we need a speed factor of 1/ratio. atempo supports
-    only 0.5-2.0 per instance, so out-of-range factors are decomposed by
-    chaining atempo=2.0 (speed up) or atempo=0.5 (slow down) instances.
+    ratio = tts_duration / target_window; the filter speeds the TTS up by 1/ratio
+    so its duration becomes target_window. atempo supports only 0.5-2.0 per
+    instance, so out-of-range factors are decomposed by chaining atempo=2.0
+    (speed up) or atempo=0.5 (slow down) instances. merge() itself never
+    stretches the timeline — it only muxes the already-synchronized track.
     """
     speed = 1.0 / ratio
     filters = []
