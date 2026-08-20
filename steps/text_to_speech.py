@@ -1,6 +1,9 @@
 import edge_tts
 import asyncio
 
+# RATE/PITCH are naturalness settings only (they are NOT used to force sync).
+# TTS duration is inherently variable and is measured by the caller after
+# generation (main.py) and passed to synthesize.py, which adapts the timeline.
 VOICE_MAP = {
     "en": "en-US-JennyNeural",
     "es": "es-ES-AlvaroNeural",
